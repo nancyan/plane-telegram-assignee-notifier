@@ -2,7 +2,12 @@ import asyncio
 
 from app.config import Settings
 from app.db import Database
-from app.service import AssigneeNotifier, mentioned_user_ids, new_assignee_ids
+from app.service import (
+    AssigneeNotifier,
+    mentioned_user_ids,
+    new_assignee_ids,
+    normalize_legacy_payload,
+)
 
 
 class FakeTelegram:
@@ -166,3 +171,107 @@ def test_comment_mention_by_configured_name_and_excludes_actor(tmp_path):
     notifier = AssigneeNotifier(settings, database, telegram)
     assert asyncio.run(notifier.process(payload)) == 1
     assert [message[0] for message in telegram.messages] == [101]
+
+
+def test_legacy_created_issue_notifies_assignee(tmp_path):
+    settings = Settings(
+        telegram_bot_token="token",
+        plane_webhook_secret="plane-secret-long-enough",
+        plane_app_url="https://plane.example.com",
+        plane_workspace_slug="acme",
+        database_path=str(tmp_path / "test.sqlite3"),
+    )
+    database = Database(settings.database_path)
+    database.initialize()
+    code = database.create_link_code("u1", 60)
+    database.redeem_link_code(code, 123, 456, "alice")
+    telegram = FakeTelegram()
+    payload = {
+        "event": "issue",
+        "action": "created",
+        "data": {
+            "id": "issue-1",
+            "name": "Legacy task",
+            "project": "project-1",
+            "assignees": [{"id": "u1", "display_name": "Alice"}],
+            "updated_at": "2026-11-05T12:00:00Z",
+        },
+        "activity": {"field": None, "old_value": None, "new_value": None},
+    }
+
+    notifier = AssigneeNotifier(settings, database, telegram)
+    result = asyncio.run(notifier.process_detailed(payload, "issue"))
+
+    assert result.event == "workitem.created"
+    assert result.sent == 1
+    assert result.event_id.startswith("legacy-")
+
+
+def test_legacy_issue_update_notifies_only_new_assignee():
+    payload = {
+        "event": "issue",
+        "action": "updated",
+        "data": {
+            "id": "issue-1",
+            "assignees": [{"id": "u1"}, {"id": "u2"}],
+            "updated_at": "2026-11-05T12:00:00Z",
+        },
+        "activity": {
+            "field": "assignees",
+            "old_value": ["u1"],
+            "new_value": ["u1", "u2"],
+        },
+    }
+
+    normalized = normalize_legacy_payload(payload, "issue")
+    assert normalized["event"] == "workitem.updated"
+    assert new_assignee_ids(normalized, normalized["event"]) == {"u2"}
+
+
+def test_legacy_unrelated_issue_update_has_no_recipients():
+    payload = {
+        "event": "issue",
+        "action": "updated",
+        "data": {"id": "issue-1", "assignees": [{"id": "u1"}]},
+        "activity": {
+            "field": "priority",
+            "old_value": "low",
+            "new_value": "high",
+        },
+    }
+
+    normalized = normalize_legacy_payload(payload, "issue")
+    assert new_assignee_ids(normalized, normalized["event"]) == set()
+
+
+def test_legacy_comment_mention_is_supported(tmp_path):
+    settings = Settings(
+        telegram_bot_token="token",
+        plane_webhook_secret="plane-secret-long-enough",
+        plane_app_url="https://plane.example.com",
+        plane_workspace_slug="acme",
+        database_path=str(tmp_path / "test.sqlite3"),
+    )
+    database = Database(settings.database_path)
+    database.initialize()
+    code = database.create_link_code("u1", 60, "Alice")
+    database.redeem_link_code(code, 123, 456, "alice")
+    telegram = FakeTelegram()
+    payload = {
+        "event": "issue_comment",
+        "action": "created",
+        "data": {
+            "id": "comment-1",
+            "issue": "issue-1",
+            "project": "project-1",
+            "actor": "u2",
+            "comment_stripped": "Проверьте, пожалуйста, @Alice.",
+        },
+        "activity": {},
+    }
+
+    notifier = AssigneeNotifier(settings, database, telegram)
+    result = asyncio.run(notifier.process_detailed(payload, "issue_comment"))
+
+    assert result.event == "workitem.comment.created"
+    assert result.sent == 1

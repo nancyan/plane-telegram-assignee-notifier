@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import re
 from dataclasses import asdict, dataclass, field
@@ -29,6 +31,129 @@ class ProcessingResult:
 
     def as_dict(self) -> dict:
         return asdict(self)
+
+
+def _ids(values) -> set[str]:
+    if values in (None, ""):
+        return set()
+    if isinstance(values, str | dict):
+        values = [values]
+    result: set[str] = set()
+    for value in values:
+        if isinstance(value, dict):
+            value = (
+                value.get("id")
+                or value.get("user_id")
+                or value.get("assignee_id")
+            )
+        if value:
+            result.add(str(value))
+    return result
+
+
+def _legacy_event_id(payload: dict) -> str:
+    data = payload.get("data") or {}
+    activity = payload.get("activity") or {}
+    event = str(payload.get("event") or "")
+    identity: dict = {
+        "event": event,
+        "action": payload.get("action"),
+        "entity_id": data.get("id") or data.get("issue"),
+    }
+    if event == "issue":
+        identity.update(
+            {
+                "updated_at": data.get("updated_at"),
+                "field": activity.get("field"),
+                "new_value": activity.get("new_value"),
+            }
+        )
+    serialized = json.dumps(identity, sort_keys=True, default=str)
+    return f"legacy-{hashlib.sha256(serialized.encode()).hexdigest()}"
+
+
+def normalize_legacy_payload(payload: dict, header_event: str | None = None) -> dict:
+    """Convert Plane's legacy issue webhook envelope to the internal v2 shape."""
+    event = str(header_event or payload.get("event") or "")
+    action = str(payload.get("action") or "").lower()
+    data = payload.get("data") or {}
+    activity = payload.get("activity") or {}
+    event_id = _legacy_event_id({**payload, "event": event})
+
+    if event == "issue":
+        action_map = {
+            "create": "workitem.created",
+            "created": "workitem.created",
+            "update": "workitem.updated",
+            "updated": "workitem.updated",
+        }
+        canonical_event = action_map.get(action, f"legacy.issue.{action or 'unknown'}")
+        current = _ids(data.get("assignees") or data.get("assignee_ids"))
+        field_name = str(activity.get("field") or "")
+        previous_attributes: dict = {}
+        if canonical_event == "workitem.updated" and field_name in {
+            "assignees",
+            "assignee_ids",
+            "assignee",
+        }:
+            previous_attributes["assignee_ids"] = sorted(
+                _ids(activity.get("old_value"))
+            )
+            requested = _ids(activity.get("new_value"))
+            if requested:
+                current = requested
+
+        project = data.get("project")
+        if isinstance(project, dict):
+            project = project.get("id")
+        normalized_data = {
+            **data,
+            "project_id": project or data.get("project_id"),
+            "assignee_ids": sorted(current),
+        }
+        return {
+            "version": "v2",
+            "event_id": event_id,
+            "event": canonical_event,
+            "data": normalized_data,
+            "previous_attributes": previous_attributes,
+            "legacy": True,
+            "legacy_action": action,
+        }
+
+    if event == "issue_comment":
+        canonical_event = (
+            "workitem.comment.created"
+            if action in {"create", "created"}
+            else f"legacy.issue_comment.{action or 'unknown'}"
+        )
+        project = data.get("project")
+        if isinstance(project, dict):
+            project = project.get("id")
+        actor = data.get("actor") or data.get("created_by")
+        if isinstance(actor, dict):
+            actor = actor.get("id")
+        comment = {
+            **data,
+            "actor_id": actor,
+            "comment_stripped": data.get("comment_stripped") or "",
+        }
+        return {
+            "version": "v2",
+            "event_id": event_id,
+            "event": canonical_event,
+            "data": {
+                "id": data.get("issue"),
+                "name": "Задача в Plane",
+                "project_id": project or data.get("project_id"),
+                "comment": comment,
+            },
+            "previous_attributes": {},
+            "legacy": True,
+            "legacy_action": action,
+        }
+
+    return payload
 
 
 def new_assignee_ids(payload: dict, event_name: str) -> set[str]:
@@ -152,6 +277,22 @@ class AssigneeNotifier:
     ) -> ProcessingResult:
         # The signed Plane header is authoritative and also works around older
         # v2 builds that serialized an internal enum name in payload.event.
+        incoming_event = str(header_event or payload.get("event") or "")
+        if payload.get("version") != "v2" and incoming_event in {
+            "issue",
+            "issue_comment",
+        }:
+            payload = normalize_legacy_payload(payload, incoming_event)
+            header_event = None
+            logger.info(
+                "Normalized legacy Plane webhook incoming_event=%s action=%s "
+                "canonical_event=%s generated_event_id=%s",
+                incoming_event,
+                payload.get("legacy_action", "<missing>"),
+                payload.get("event"),
+                payload.get("event_id"),
+            )
+
         event_name = str(header_event or payload.get("event") or "")
         event_id = str(payload.get("event_id") or "")
         data = payload.get("data") or {}
