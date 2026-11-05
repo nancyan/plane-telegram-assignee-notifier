@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import logging
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 
@@ -16,21 +17,55 @@ logging.basicConfig(level=settings.log_level.upper())
 logger = logging.getLogger(__name__)
 
 database = Database(settings.database_path)
-telegram = TelegramClient(settings.telegram_bot_token)
+telegram = TelegramClient(
+    settings.telegram_bot_token, proxy_url=settings.telegram_proxy_url
+)
 notifier = AssigneeNotifier(settings, database, telegram)
+
+
+async def _poll_telegram_updates() -> None:
+    offset: int | None = None
+    while True:
+        try:
+            updates = await telegram.get_updates(offset=offset, timeout=30)
+            for update in updates:
+                try:
+                    if update.get("message"):
+                        await _handle_message(update["message"])
+                except Exception:
+                    logger.exception(
+                        "Failed to process Telegram update %s", update.get("update_id")
+                    )
+                finally:
+                    if update.get("update_id") is not None:
+                        offset = int(update["update_id"]) + 1
+        except asyncio.CancelledError:
+            raise
+        except TelegramError as exc:
+            logger.warning("Telegram polling failed: %s; retrying", exc)
+            await asyncio.sleep(5)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     database.initialize()
-    if settings.telegram_webhook_url:
+    polling_task: asyncio.Task | None = None
+    if settings.telegram_update_mode == "webhook":
+        assert settings.telegram_webhook_url
+        assert settings.telegram_webhook_secret
         await telegram.set_webhook(
             settings.telegram_webhook_url, settings.telegram_webhook_secret
         )
         logger.info("Telegram webhook configured")
     else:
-        logger.warning("PUBLIC_BASE_URL is empty; Telegram commands will not arrive")
+        await telegram.delete_webhook()
+        polling_task = asyncio.create_task(_poll_telegram_updates())
+        logger.info("Telegram long polling started")
     yield
+    if polling_task:
+        polling_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await polling_task
     await telegram.close()
 
 
@@ -94,7 +129,7 @@ async def _connect(chat: dict, sender: dict, code: str) -> None:
     await telegram.send_message(
         int(chat["id"]),
         "✅ Аккаунт подключён. Теперь новые задачи, назначенные вам в Plane, "
-        "будут приходить сюда.",
+        "и упоминания в комментариях будут приходить сюда.",
     )
 
 
@@ -144,7 +179,9 @@ async def _handle_message(message: dict) -> None:
             await telegram.send_message(
                 chat_id,
                 f"Уведомления: <b>{state}</b>\nPlane user ID: "
-                f"<code>{link['plane_user_id']}</code>",
+                f"<code>{link['plane_user_id']}</code>\n"
+                f"Имя для упоминаний: "
+                f"<code>{link['plane_mention_name'] or 'не задано'}</code>",
             )
         return
 
@@ -166,11 +203,15 @@ async def _handle_message(message: dict) -> None:
             return
         if not arguments:
             await telegram.send_message(
-                chat_id, "Использование: <code>/linkcode PLANE_USER_UUID</code>"
+                chat_id,
+                "Использование: <code>/linkcode PLANE_USER_UUID @ИМЯ_В_PLANE</code>\n"
+                "Имя необязательно, но нужно для уведомлений об упоминаниях.",
             )
             return
         code = database.create_link_code(
-            arguments[0], settings.link_code_ttl_minutes
+            arguments[0],
+            settings.link_code_ttl_minutes,
+            " ".join(arguments[1:]) if len(arguments) > 1 else None,
         )
         if settings.telegram_bot_username:
             link = f"https://t.me/{settings.telegram_bot_username}?start={code}"
@@ -194,6 +235,9 @@ async def telegram_webhook(
     request: Request,
     x_telegram_bot_api_secret_token: str | None = Header(default=None),
 ) -> Response:
+    if settings.telegram_update_mode != "webhook":
+        raise HTTPException(status_code=409, detail="Telegram polling mode is active")
+    assert settings.telegram_webhook_secret
     if not constant_time_equal(
         x_telegram_bot_api_secret_token, settings.telegram_webhook_secret
     ):

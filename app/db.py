@@ -38,6 +38,7 @@ class Database:
                     telegram_chat_id INTEGER NOT NULL UNIQUE,
                     telegram_user_id INTEGER NOT NULL,
                     telegram_username TEXT,
+                    plane_mention_name TEXT,
                     active INTEGER NOT NULL DEFAULT 1,
                     linked_at TEXT NOT NULL
                 );
@@ -45,6 +46,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS link_codes (
                     code_hash TEXT PRIMARY KEY,
                     plane_user_id TEXT NOT NULL,
+                    plane_mention_name TEXT,
                     expires_at TEXT NOT NULL,
                     used_at TEXT
                 );
@@ -57,8 +59,30 @@ class Database:
                 );
                 """
             )
+            self._ensure_column(
+                connection, "user_links", "plane_mention_name", "TEXT"
+            )
+            self._ensure_column(
+                connection, "link_codes", "plane_mention_name", "TEXT"
+            )
 
-    def create_link_code(self, plane_user_id: str, ttl_minutes: int) -> str:
+    @staticmethod
+    def _ensure_column(
+        connection: sqlite3.Connection, table: str, column: str, column_type: str
+    ) -> None:
+        columns = {
+            str(row["name"])
+            for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column not in columns:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+
+    def create_link_code(
+        self,
+        plane_user_id: str,
+        ttl_minutes: int,
+        plane_mention_name: str | None = None,
+    ) -> str:
         code = secrets.token_urlsafe(9)
         now = datetime.now(UTC)
         expires_at = now + timedelta(minutes=ttl_minutes)
@@ -69,10 +93,16 @@ class Database:
             )
             connection.execute(
                 """
-                INSERT INTO link_codes(code_hash, plane_user_id, expires_at)
-                VALUES(?, ?, ?)
+                INSERT INTO link_codes(
+                    code_hash, plane_user_id, plane_mention_name, expires_at
+                ) VALUES(?, ?, ?, ?)
                 """,
-                (hash_link_code(code), plane_user_id, expires_at.isoformat()),
+                (
+                    hash_link_code(code),
+                    plane_user_id,
+                    self.normalize_mention_name(plane_mention_name),
+                    expires_at.isoformat(),
+                ),
             )
         return code
 
@@ -87,7 +117,7 @@ class Database:
         with self.connect() as connection:
             row = connection.execute(
                 """
-                SELECT plane_user_id, expires_at
+                SELECT plane_user_id, plane_mention_name, expires_at
                 FROM link_codes
                 WHERE code_hash = ? AND used_at IS NULL
                 """,
@@ -108,12 +138,15 @@ class Database:
                 """
                 INSERT INTO user_links(
                     plane_user_id, telegram_chat_id, telegram_user_id,
-                    telegram_username, active, linked_at
-                ) VALUES(?, ?, ?, ?, 1, ?)
+                    telegram_username, plane_mention_name, active, linked_at
+                ) VALUES(?, ?, ?, ?, ?, 1, ?)
                 ON CONFLICT(plane_user_id) DO UPDATE SET
                     telegram_chat_id = excluded.telegram_chat_id,
                     telegram_user_id = excluded.telegram_user_id,
                     telegram_username = excluded.telegram_username,
+                    plane_mention_name = COALESCE(
+                        excluded.plane_mention_name, user_links.plane_mention_name
+                    ),
                     active = 1,
                     linked_at = excluded.linked_at
                 """,
@@ -122,6 +155,7 @@ class Database:
                     telegram_chat_id,
                     telegram_user_id,
                     telegram_username,
+                    row["plane_mention_name"],
                     now.isoformat(),
                 ),
             )
@@ -130,6 +164,22 @@ class Database:
                 (now.isoformat(), hash_link_code(code)),
             )
             return plane_user_id
+
+    @staticmethod
+    def normalize_mention_name(value: str | None) -> str | None:
+        if not value:
+            return None
+        normalized = " ".join(value.strip().lstrip("@").split()).casefold()
+        return normalized or None
+
+    def get_active_mention_links(self) -> list[sqlite3.Row]:
+        with self.connect() as connection:
+            return connection.execute(
+                """
+                SELECT * FROM user_links
+                WHERE active = 1 AND plane_mention_name IS NOT NULL
+                """
+            ).fetchall()
 
     def get_link_by_chat(self, telegram_chat_id: int) -> sqlite3.Row | None:
         with self.connect() as connection:

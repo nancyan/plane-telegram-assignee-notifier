@@ -8,9 +8,10 @@ class TelegramError(RuntimeError):
 
 
 class TelegramClient:
-    def __init__(self, bot_token: str):
+    def __init__(self, bot_token: str, proxy_url: str | None = None):
         self.base_url = f"https://api.telegram.org/bot{bot_token}"
-        self.http = httpx.AsyncClient(timeout=15)
+        timeout = httpx.Timeout(45, connect=15)
+        self.http = httpx.AsyncClient(timeout=timeout, proxy=proxy_url)
 
     async def close(self) -> None:
         await self.http.aclose()
@@ -55,3 +56,15 @@ class TelegramClient:
                 "drop_pending_updates": False,
             },
         )
+
+    async def delete_webhook(self) -> None:
+        await self._call("deleteWebhook", {"drop_pending_updates": False})
+
+    async def get_updates(
+        self, offset: int | None = None, timeout: int = 30
+    ) -> list[dict]:
+        payload: dict = {"timeout": timeout, "allowed_updates": ["message"]}
+        if offset is not None:
+            payload["offset"] = offset
+        body = await self._call("getUpdates", payload)
+        return list(body.get("result") or [])

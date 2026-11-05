@@ -1,6 +1,7 @@
 from functools import lru_cache
+from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -10,8 +11,10 @@ class Settings(BaseSettings):
     )
 
     telegram_bot_token: str
-    telegram_webhook_secret: str = Field(min_length=16)
+    telegram_update_mode: Literal["polling", "webhook"] = "polling"
+    telegram_webhook_secret: str | None = Field(default=None, min_length=16)
     telegram_bot_username: str | None = None
+    telegram_proxy_url: str | None = None
     public_base_url: str | None = None
 
     plane_webhook_secret: str = Field(min_length=16)
@@ -25,6 +28,26 @@ class Settings(BaseSettings):
     admin_telegram_user_ids: str = ""
     link_code_ttl_minutes: int = Field(default=60, ge=5, le=10080)
     log_level: str = "INFO"
+
+    @field_validator("telegram_proxy_url")
+    @classmethod
+    def validate_telegram_proxy_url(cls, value: str | None) -> str | None:
+        if value in (None, ""):
+            return None
+        if not value.startswith("socks5://"):
+            raise ValueError("TELEGRAM_PROXY_URL must start with socks5://")
+        return value
+
+    @model_validator(mode="after")
+    def validate_webhook_settings(self):
+        if self.telegram_update_mode == "webhook":
+            if not self.public_base_url:
+                raise ValueError("PUBLIC_BASE_URL is required in Telegram webhook mode")
+            if not self.telegram_webhook_secret:
+                raise ValueError(
+                    "TELEGRAM_WEBHOOK_SECRET is required in Telegram webhook mode"
+                )
+        return self
 
     @property
     def admin_ids(self) -> set[int]:
