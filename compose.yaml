@@ -7,6 +7,14 @@ services:
       - "8000:8000"
     volumes:
       - notifier-data:/app/data
+    networks:
+      hosting_net:
+        aliases:
+          - notifier.internal
 
 volumes:
   notifier-data:
+
+networks:
+  hosting_net:
+    external: true
