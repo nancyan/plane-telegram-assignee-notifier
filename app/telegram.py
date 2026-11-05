@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import logging
+
 import httpx
+
+logger = logging.getLogger(__name__)
 
 
 class TelegramError(RuntimeError):
@@ -9,6 +13,7 @@ class TelegramError(RuntimeError):
 
 class TelegramClient:
     def __init__(self, bot_token: str, proxy_url: str | None = None):
+        self.bot_token = bot_token
         self.base_url = f"https://api.telegram.org/bot{bot_token}"
         timeout = httpx.Timeout(45, connect=15)
         self.http = httpx.AsyncClient(timeout=timeout, proxy=proxy_url)
@@ -17,7 +22,19 @@ class TelegramClient:
         await self.http.aclose()
 
     async def _call(self, method: str, payload: dict) -> dict:
-        response = await self.http.post(f"{self.base_url}/{method}", json=payload)
+        logger.debug("Calling Telegram Bot API method=%s", method)
+        try:
+            response = await self.http.post(
+                f"{self.base_url}/{method}", json=payload
+            )
+        except httpx.HTTPError as exc:
+            detail = str(exc).replace(self.bot_token, "<redacted>")
+            logger.error(
+                "Telegram Bot API network error method=%s error=%s",
+                method,
+                detail,
+            )
+            raise TelegramError(f"{method}: {detail}") from exc
         try:
             body = response.json()
         except ValueError as exc:
@@ -26,7 +43,19 @@ class TelegramClient:
             ) from exc
         if not response.is_success or not body.get("ok"):
             description = body.get("description", f"HTTP {response.status_code}")
+            logger.error(
+                "Telegram Bot API rejected request method=%s status=%s "
+                "description=%s",
+                method,
+                response.status_code,
+                description,
+            )
             raise TelegramError(str(description))
+        logger.debug(
+            "Telegram Bot API request succeeded method=%s status=%s",
+            method,
+            response.status_code,
+        )
         return body
 
     async def send_message(

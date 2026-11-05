@@ -1,14 +1,34 @@
 from __future__ import annotations
 
+import logging
 import re
+from dataclasses import asdict, dataclass, field
 from html import escape
 
 from app.config import Settings
 from app.db import Database
 
+logger = logging.getLogger(__name__)
+
 
 class NotificationDeliveryError(RuntimeError):
     pass
+
+
+@dataclass
+class ProcessingResult:
+    event: str
+    event_id: str
+    work_item_id: str
+    status: str
+    recipients: list[str] = field(default_factory=list)
+    sent: int = 0
+    delivered_to: list[str] = field(default_factory=list)
+    skipped_unlinked: list[str] = field(default_factory=list)
+    skipped_duplicate: list[str] = field(default_factory=list)
+
+    def as_dict(self) -> dict:
+        return asdict(self)
 
 
 def new_assignee_ids(payload: dict, event_name: str) -> set[str]:
@@ -127,49 +147,146 @@ class AssigneeNotifier:
             recipients.discard(str(actor_id))
         return recipients
 
-    async def process(self, payload: dict, header_event: str | None = None) -> int:
+    async def process_detailed(
+        self, payload: dict, header_event: str | None = None
+    ) -> ProcessingResult:
         # The signed Plane header is authoritative and also works around older
         # v2 builds that serialized an internal enum name in payload.event.
         event_name = str(header_event or payload.get("event") or "")
+        event_id = str(payload.get("event_id") or "")
+        data = payload.get("data") or {}
+        work_item_id = str(data.get("id") or "")
+        result = ProcessingResult(
+            event=event_name,
+            event_id=event_id,
+            work_item_id=work_item_id,
+            status="received",
+        )
+        logger.info(
+            "Processing Plane webhook event=%s event_id=%s version=%s "
+            "work_item_id=%s header_event=%s",
+            event_name or "<missing>",
+            event_id or "<missing>",
+            payload.get("version") or "<missing>",
+            work_item_id or "<missing>",
+            header_event or "<missing>",
+        )
         if event_name not in {
             "workitem.created",
             "workitem.updated",
             "workitem.comment.created",
         }:
-            return 0
+            result.status = "ignored_unsupported_event"
+            logger.warning(
+                "Ignoring unsupported Plane event event=%s event_id=%s",
+                event_name or "<missing>",
+                event_id or "<missing>",
+            )
+            return result
         if payload.get("version") != "v2":
-            return 0
+            result.status = "ignored_unsupported_version"
+            logger.warning(
+                "Ignoring Plane webhook with unsupported version=%s event=%s",
+                payload.get("version") or "<missing>",
+                event_name,
+            )
+            return result
 
-        event_id = str(payload.get("event_id") or "")
         if not event_id:
+            logger.error("Plane v2 webhook has no event_id event=%s", event_name)
             raise ValueError("Plane v2 payload has no event_id")
 
-        data = payload.get("data") or {}
         if event_name == "workitem.comment.created":
             recipients = self._comment_recipients(payload)
             message, markup = self._comment_message(data)
         else:
             recipients = new_assignee_ids(payload, event_name)
             message, markup = self._message(data, event_name)
+        result.recipients = sorted(recipients)
+        logger.info(
+            "Resolved Plane recipients event=%s event_id=%s count=%d ids=%s",
+            event_name,
+            event_id,
+            len(recipients),
+            ",".join(result.recipients) or "<none>",
+        )
+        if not recipients:
+            result.status = "no_recipients"
+            logger.warning(
+                "No notification recipients resolved event=%s event_id=%s "
+                "work_item_id=%s",
+                event_name,
+                event_id,
+                work_item_id or "<missing>",
+            )
+            return result
+
         sent = 0
         failures: list[str] = []
 
-        for plane_user_id in recipients:
+        for plane_user_id in sorted(recipients):
             if self.database.notification_was_sent(event_id, plane_user_id):
+                result.skipped_duplicate.append(plane_user_id)
+                logger.info(
+                    "Skipping duplicate notification event_id=%s plane_user_id=%s",
+                    event_id,
+                    plane_user_id,
+                )
                 continue
             link = self.database.get_active_link(plane_user_id)
             if not link:
+                result.skipped_unlinked.append(plane_user_id)
+                logger.warning(
+                    "No active Telegram link event_id=%s plane_user_id=%s",
+                    event_id,
+                    plane_user_id,
+                )
                 continue
             try:
+                logger.info(
+                    "Sending Telegram notification event_id=%s plane_user_id=%s "
+                    "telegram_chat_id=%s",
+                    event_id,
+                    plane_user_id,
+                    link["telegram_chat_id"],
+                )
                 await self.telegram.send_message(
                     int(link["telegram_chat_id"]), message, reply_markup=markup
                 )
             except Exception as exc:  # Telegram errors must trigger a Plane retry.
                 failures.append(f"{plane_user_id}: {exc}")
+                logger.exception(
+                    "Telegram delivery failed event_id=%s plane_user_id=%s",
+                    event_id,
+                    plane_user_id,
+                )
                 continue
             self.database.mark_notification_sent(event_id, plane_user_id)
             sent += 1
+            result.delivered_to.append(plane_user_id)
+            logger.info(
+                "Telegram notification delivered event_id=%s plane_user_id=%s",
+                event_id,
+                plane_user_id,
+            )
 
         if failures:
             raise NotificationDeliveryError("; ".join(failures))
-        return sent
+        result.sent = sent
+        result.status = "delivered" if sent else "processed_without_delivery"
+        logger.info(
+            "Plane webhook processed event=%s event_id=%s status=%s sent=%d "
+            "unlinked=%d duplicates=%d",
+            event_name,
+            event_id,
+            result.status,
+            sent,
+            len(result.skipped_unlinked),
+            len(result.skipped_duplicate),
+        )
+        return result
+
+    async def process(self, payload: dict, header_event: str | None = None) -> int:
+        """Compatibility wrapper returning only the number of delivered messages."""
+        result = await self.process_detailed(payload, header_event)
+        return result.sent

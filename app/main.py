@@ -13,7 +13,15 @@ from app.service import AssigneeNotifier, NotificationDeliveryError
 from app.telegram import TelegramClient, TelegramError
 
 settings = get_settings()
-logging.basicConfig(level=settings.log_level.upper())
+configured_log_level = settings.log_level.upper()
+logging.basicConfig(level=configured_log_level)
+# Uvicorn may configure handlers before importing the app, making basicConfig a
+# no-op. Set the root level explicitly so LOG_LEVEL always takes effect.
+logging.getLogger().setLevel(configured_log_level)
+# httpx includes the bot token in its request URL. Keep its own access log off;
+# app.telegram emits safe method/status diagnostics instead.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 database = Database(settings.database_path)
@@ -28,6 +36,8 @@ async def _poll_telegram_updates() -> None:
     while True:
         try:
             updates = await telegram.get_updates(offset=offset, timeout=30)
+            if updates:
+                logger.info("Telegram polling received updates count=%d", len(updates))
             for update in updates:
                 try:
                     if update.get("message"):
@@ -49,6 +59,15 @@ async def _poll_telegram_updates() -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     database.initialize()
+    logger.info(
+        "Notifier starting telegram_mode=%s proxy_configured=%s "
+        "plane_workspace=%s database=%s log_level=%s",
+        settings.telegram_update_mode,
+        bool(settings.telegram_proxy_url),
+        settings.plane_workspace_slug,
+        settings.database_path,
+        settings.log_level.upper(),
+    )
     polling_task: asyncio.Task | None = None
     if settings.telegram_update_mode == "webhook":
         assert settings.telegram_webhook_url
@@ -86,19 +105,42 @@ async def plane_webhook(
     x_plane_event: str | None = Header(default=None),
 ) -> dict:
     raw_body = await request.body()
+    client = request.client.host if request.client else "unknown"
+    logger.info(
+        "Plane webhook request received client=%s bytes=%d header_event=%s "
+        "signature_present=%s",
+        client,
+        len(raw_body),
+        x_plane_event or "<missing>",
+        bool(x_plane_signature),
+    )
     if not verify_plane_signature(
         raw_body, settings.plane_webhook_secret, x_plane_signature
     ):
+        logger.warning(
+            "Plane webhook signature rejected client=%s header_event=%s",
+            client,
+            x_plane_event or "<missing>",
+        )
         raise HTTPException(status_code=401, detail="Invalid Plane signature")
     try:
         payload = await request.json()
-        sent = await notifier.process(payload, x_plane_event)
+        result = await notifier.process_detailed(payload, x_plane_event)
     except NotificationDeliveryError as exc:
         logger.warning("Telegram delivery failed: %s", exc)
         raise HTTPException(status_code=502, detail="Telegram delivery failed") from exc
     except (ValueError, TypeError) as exc:
+        logger.warning("Invalid Plane webhook payload: %s", exc)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"ok": True, "sent": sent}
+    response = {"ok": True, **result.as_dict()}
+    logger.info(
+        "Plane webhook response event=%s event_id=%s status=%s sent=%d",
+        result.event,
+        result.event_id or "<missing>",
+        result.status,
+        result.sent,
+    )
+    return response
 
 
 def _command_parts(text: str) -> tuple[str, list[str]]:
@@ -122,10 +164,21 @@ async def _connect(chat: dict, sender: dict, code: str) -> None:
         sender.get("username"),
     )
     if not plane_user_id:
+        logger.warning(
+            "Telegram account link rejected telegram_user_id=%s chat_id=%s",
+            sender.get("id"),
+            chat.get("id"),
+        )
         await telegram.send_message(
             int(chat["id"]), "Код недействителен, уже использован или истёк."
         )
         return
+    logger.info(
+        "Telegram account linked plane_user_id=%s telegram_user_id=%s chat_id=%s",
+        plane_user_id,
+        sender.get("id"),
+        chat.get("id"),
+    )
     await telegram.send_message(
         int(chat["id"]),
         "✅ Аккаунт подключён. Теперь новые задачи, назначенные вам в Plane, "
@@ -141,6 +194,12 @@ async def _handle_message(message: dict) -> None:
         return
     command, arguments = _command_parts(str(text))
     chat_id = int(chat["id"])
+    logger.info(
+        "Telegram command received command=%s telegram_user_id=%s chat_id=%s",
+        command or "<none>",
+        sender.get("id"),
+        chat_id,
+    )
 
     if command == "/start":
         if arguments:
@@ -212,6 +271,11 @@ async def _handle_message(message: dict) -> None:
             arguments[0],
             settings.link_code_ttl_minutes,
             " ".join(arguments[1:]) if len(arguments) > 1 else None,
+        )
+        logger.info(
+            "Admin created link code plane_user_id=%s mention_name_configured=%s",
+            arguments[0],
+            len(arguments) > 1,
         )
         if settings.telegram_bot_username:
             link = f"https://t.me/{settings.telegram_bot_username}?start={code}"

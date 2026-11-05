@@ -72,6 +72,48 @@ def test_delivery_is_deduplicated(tmp_path):
     assert telegram.messages[0][0] == 123
 
 
+def test_detailed_result_explains_unlinked_recipient(tmp_path):
+    settings = Settings(
+        telegram_bot_token="token",
+        plane_webhook_secret="plane-secret-long-enough",
+        plane_app_url="https://plane.example.com",
+        plane_workspace_slug="acme",
+        database_path=str(tmp_path / "test.sqlite3"),
+    )
+    database = Database(settings.database_path)
+    database.initialize()
+    notifier = AssigneeNotifier(settings, database, FakeTelegram())
+
+    result = asyncio.run(
+        notifier.process_detailed(make_payload("workitem.created", ["u1"]))
+    )
+
+    assert result.status == "processed_without_delivery"
+    assert result.recipients == ["u1"]
+    assert result.skipped_unlinked == ["u1"]
+    assert result.sent == 0
+
+
+def test_detailed_result_explains_unsupported_event(tmp_path):
+    settings = Settings(
+        telegram_bot_token="token",
+        plane_webhook_secret="plane-secret-long-enough",
+        plane_app_url="https://plane.example.com",
+        plane_workspace_slug="acme",
+        database_path=str(tmp_path / "test.sqlite3"),
+    )
+    database = Database(settings.database_path)
+    database.initialize()
+    notifier = AssigneeNotifier(settings, database, FakeTelegram())
+
+    result = asyncio.run(
+        notifier.process_detailed(make_payload("project.created", []))
+    )
+
+    assert result.status == "ignored_unsupported_event"
+    assert result.sent == 0
+
+
 def test_comment_mention_by_structured_user_id(tmp_path):
     settings = Settings(
         telegram_bot_token="token",

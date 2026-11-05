@@ -107,6 +107,36 @@ curl https://plane-notifier.example.com/health
 docker compose up -d --force-recreate
 ```
 
+### Диагностика
+
+Смотреть обработку webhook и отправку сообщений в реальном времени:
+
+```bash
+docker compose logs -f notifier
+```
+
+При `LOG_LEVEL=INFO` сервис пишет тип и ID события, найденных получателей,
+причины пропуска (`нет привязки`, `уже отправлено`, `получатели не найдены`) и
+результат Telegram. `LOG_LEVEL=DEBUG` дополнительно показывает вызовы методов
+Telegram Bot API. Токен и webhook-секреты в логи не выводятся.
+
+Успешный HTTP 200 теперь содержит подробный JSON, например:
+
+```json
+{
+  "ok": true,
+  "event": "workitem.created",
+  "event_id": "...",
+  "work_item_id": "...",
+  "status": "processed_without_delivery",
+  "recipients": ["plane-user-uuid"],
+  "sent": 0,
+  "delivered_to": [],
+  "skipped_unlinked": ["plane-user-uuid"],
+  "skipped_duplicate": []
+}
+```
+
 Используйте именно webhook v2. Старые webhook v1 не содержат стабильного
 `event_id` и `previous_attributes`.
 
