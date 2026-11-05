@@ -1,0 +1,16 @@
+[project]
+name = "plane-telegram-assignee-notifier"
+version = "0.1.0"
+description = "Personal Telegram notifications for newly assigned Plane work items"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
