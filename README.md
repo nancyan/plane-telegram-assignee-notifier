@@ -1,67 +1,66 @@
 # Plane Telegram Assignee Notifier
 
-Небольшой self-hosted сервис, который отправляет пользователю личное сообщение
-в Telegram, когда его назначают исполнителем задачи в Plane или упоминают в
-комментарии.
+A small self-hosted service that sends private Telegram messages when a user is
+assigned to a Plane work item or mentioned in a comment.
 
-Поддерживаются три случая:
+It supports three notification scenarios:
 
-- исполнитель указан при создании задачи (`workitem.created`);
-- исполнитель добавлен позднее (`workitem.updated`);
-- пользователя отметили в комментарии (`workitem.comment.created`).
+- an assignee is set when a work item is created (`workitem.created`);
+- an assignee is added later (`workitem.updated`);
+- a user is mentioned in a comment (`workitem.comment.created`).
 
-Сервис поддерживает Plane Webhooks v2 и legacy-события `issue` и
-`issue_comment`, которые Community Edition продолжает отправлять в некоторых
-установках. Он проверяет HMAC-подпись и защищается от повторной отправки по
-`event_id` или детерминированному идентификатору legacy-события.
+The service supports Plane Webhooks v2 as well as the legacy `issue` and
+`issue_comment` events still emitted by Community Edition in some deployments.
+It verifies HMAC signatures and prevents duplicate notifications using either
+the v2 `event_id` or a deterministic identifier generated for legacy events.
 
-## Как это работает
+## How it works
 
-1. Администратор создаёт одноразовую ссылку для Plane User UUID.
-2. Пользователь открывает ссылку и нажимает Start в Telegram.
-3. Сервис сохраняет связь `Plane user UUID → Telegram private chat_id`.
-4. Plane отправляет событие о задаче или новом комментарии.
-5. Бот пишет новым исполнителям и упомянутым пользователям только в личный чат.
+1. An administrator creates a one-time link for a Plane user UUID.
+2. The user opens the link and presses **Start** in Telegram.
+3. The service stores the `Plane user UUID → Telegram private chat_id` mapping.
+4. Plane sends a work-item or comment event to the service.
+5. The bot sends a private message to new assignees or mentioned users.
 
-Бот Telegram не может первым начать разговор, поэтому каждый сотрудник должен
-один раз открыть бота и нажать **Start**.
+A Telegram bot cannot initiate a conversation, so every user must open the bot
+and press **Start** at least once.
 
-## Быстрый запуск
+## Quick start
 
-### 1. Создайте Telegram-бота
+### 1. Create a Telegram bot
 
-Создайте бота через `@BotFather`, получите токен и узнайте username бота без
-символа `@`.
+Create a bot with `@BotFather`, copy its token, and note its username without
+the leading `@`.
 
-### 2. Настройте переменные
+### 2. Configure the environment
 
 ```bash
 cp .env.example .env
 ```
 
-Заполните `.env`. По умолчанию бот получает команды через long polling:
+Fill in `.env`. By default, the bot receives Telegram commands through long
+polling:
 
 ```dotenv
 TELEGRAM_UPDATE_MODE=polling
 ```
 
-В этом режиме Telegram не подключается к вашему серверу: сервис сам запрашивает
-обновления у Telegram Bot API. Это рекомендуемый вариант для серверов, до
-которых Telegram не может достучаться извне.
+In this mode, Telegram does not need to connect to your server. The service
+requests updates from the Telegram Bot API itself. This is the recommended mode
+when Telegram cannot reach the server from the public internet.
 
-Если сервер не может подключаться к Telegram напрямую, задайте SOCKS5-прокси:
+If the server cannot connect to Telegram directly, configure a SOCKS5 proxy:
 
 ```dotenv
 TELEGRAM_PROXY_URL=socks5://username:password@proxy.example.com:1080
 ```
 
-Прокси применяется ко всем исходящим запросам сервиса в Telegram Bot API:
-получению команд через polling, отправке сообщений и управлению Telegram
-webhook. Специальные символы в имени пользователя и пароле прокси необходимо
-URL-кодировать.
+The proxy is used for all outgoing Telegram Bot API requests, including polling,
+sending messages, and managing the Telegram webhook. URL-encode special
+characters in the proxy username and password.
 
-Если прямые входящие соединения Telegram доступны, можно использовать прежний
-webhook-режим:
+If Telegram can make incoming connections to the service, webhook mode is also
+available:
 
 ```dotenv
 TELEGRAM_UPDATE_MODE=webhook
@@ -69,60 +68,62 @@ TELEGRAM_WEBHOOK_SECRET=replace-with-a-long-random-secret
 PUBLIC_BASE_URL=https://plane-notifier.example.com
 ```
 
-При запуске сервис автоматически регистрирует или удаляет Telegram webhook в
-зависимости от выбранного режима. `PUBLIC_BASE_URL` не требуется для polling.
-Webhook Plane на `/webhooks/plane` остаётся отдельным: его должна вызывать ваша
-инсталляция Plane.
+On startup, the service registers or removes the Telegram webhook according to
+the selected mode. `PUBLIC_BASE_URL` is not required for polling. The Plane
+webhook at `/webhooks/plane` is separate and must remain reachable from your
+Plane installation.
 
-Сгенерировать секрет Plane (и отдельный секрет Telegram для webhook-режима)
-можно, например, так:
+You can generate the Telegram webhook secret with:
 
 ```bash
 python -c "import secrets; print(secrets.token_urlsafe(32))"
 ```
 
-### 3. Запустите сервис
+The Plane webhook secret is generated by Plane when the webhook is created. Do
+not generate `PLANE_WEBHOOK_SECRET` yourself.
+
+### 3. Start the service
 
 ```bash
 docker compose up -d --build
 docker compose logs -f notifier
 ```
 
-Проверка:
+Health check:
 
 ```bash
 curl https://plane-notifier.example.com/health
 ```
 
-### 4. Добавьте webhook в Plane
+### 4. Add a webhook in Plane
 
-Откройте **Workspace settings → Webhooks → Add webhook**:
+Open **Workspace settings → Webhooks → Add webhook** and configure:
 
 - URL: `https://plane-notifier.example.com/webhooks/plane`;
-- события: `Work items → Created`, `Work items → Updated` и
+- events: `Work items → Created`, `Work items → Updated`, and
   `Work item comments → Created`;
-- сохраните скачанный секрет в `PLANE_WEBHOOK_SECRET`.
+- save the generated secret as `PLANE_WEBHOOK_SECRET` in `.env`.
 
-После изменения `.env` перезапустите контейнер:
+After changing `.env`, recreate the container:
 
 ```bash
 docker compose up -d --force-recreate
 ```
 
-### Диагностика
+### Diagnostics
 
-Смотреть обработку webhook и отправку сообщений в реальном времени:
+Follow webhook processing and Telegram deliveries in real time:
 
 ```bash
 docker compose logs -f notifier
 ```
 
-При `LOG_LEVEL=INFO` сервис пишет тип и ID события, найденных получателей,
-причины пропуска (`нет привязки`, `уже отправлено`, `получатели не найдены`) и
-результат Telegram. `LOG_LEVEL=DEBUG` дополнительно показывает вызовы методов
-Telegram Bot API. Токен и webhook-секреты в логи не выводятся.
+With `LOG_LEVEL=INFO`, the service logs the event type and ID, resolved
+recipients, skip reasons (`not linked`, `already sent`, or `no recipients`), and
+the Telegram delivery result. `LOG_LEVEL=DEBUG` additionally logs Telegram Bot
+API method calls. Bot tokens and webhook secrets are never logged.
 
-Успешный HTTP 200 теперь содержит подробный JSON, например:
+A successful HTTP 200 response contains detailed diagnostics, for example:
 
 ```json
 {
@@ -139,57 +140,56 @@ Telegram Bot API. Токен и webhook-секреты в логи не выво
 }
 ```
 
-Webhook v2 используется автоматически, если Plane его предоставляет. Для
-legacy webhook бот преобразует `issue`/`issue_comment` во внутренний формат и
-учитывает поля `action` и `activity`.
+Webhook v2 is used automatically when Plane provides it. For a legacy webhook,
+the bot converts `issue` and `issue_comment` into its internal event format and
+uses the `action` and `activity` fields to determine what changed.
 
-## Подключение сотрудников
+## Linking users
 
-Добавьте свой числовой Telegram user ID в `ADMIN_TELEGRAM_USER_IDS`. Затем
-отправьте боту:
+Add your numeric Telegram user ID to `ADMIN_TELEGRAM_USER_IDS`, then send this
+command to the bot:
 
 ```text
-/linkcode PLANE_USER_UUID @ИМЯ_В_PLANE
+/linkcode PLANE_USER_UUID @PLANE_MENTION_NAME
 ```
 
-`@ИМЯ_В_PLANE` — имя, которое появляется в тексте комментария после выбора
-пользователя из списка упоминаний Plane. Оно может содержать пробелы, например
-`@Анна Иванова`.
+`@PLANE_MENTION_NAME` is the name shown in the comment text after selecting a
+user from Plane's mention list. It may contain spaces, for example
+`@Anna Smith`.
 
-Бот вернёт одноразовую ссылку. Передайте её соответствующему сотруднику.
-Ссылка действует 60 минут по умолчанию и может быть использована только один
-раз.
+The bot returns a one-time link. Send it to the corresponding user. By default,
+the link expires after 60 minutes and can only be used once.
 
-Альтернативно ссылку можно создать внутри контейнера:
+Alternatively, create the link inside the container:
 
 ```bash
 docker compose exec notifier python -m app.cli create-link PLANE_USER_UUID \
-  --mention-name "Анна Иванова"
+  --mention-name "Anna Smith"
 ```
 
-Plane Webhooks v2 в документированном payload комментария передаёт текст, но
-не UUID упомянутых пользователей. Поэтому для уведомлений об упоминаниях важно
-задать точное имя при создании ссылки. Если конкретная версия Plane всё же
-передаёт `mentioned_user_ids`, сервис использует их автоматически. Для уже
-привязанного пользователя создайте новую ссылку с именем и подключите её ещё
-раз — существующая запись безопасно обновится.
+The documented Plane Webhooks v2 comment payload includes comment text but does
+not include the UUIDs of mentioned users. Therefore, the exact mention name
+must be provided when creating a link. If a Plane version supplies
+`mentioned_user_ids`, the service uses them automatically. To add a mention name
+for an already linked user, create a new link and connect the account again; the
+existing mapping is updated safely.
 
-### Команды пользователя
+### User commands
 
-- `/start` — включить уведомления;
-- `/connect КОД` — подключить Plane вручную;
-- `/status` — показать состояние связи;
-- `/stop` — отключить уведомления;
-- `/help` — справка.
+- `/start` — enable notifications;
+- `/connect CODE` — connect a Plane account manually;
+- `/status` — show the current link status;
+- `/stop` — disable notifications;
+- `/help` — show help.
 
-## Сообщение пользователю
+## Notification contents
 
-Уведомление о назначении содержит название задачи, номер, приоритет и срок.
-Уведомление об упоминании содержит название задачи и фрагмент комментария. В
-обоих случаях бот добавляет кнопку **Открыть в Plane**. Если ваша версия Plane
-использует другой формат ссылок, измените `WORK_ITEM_URL_TEMPLATE` в `.env`.
+Assignment notifications include the work-item title, sequence number, priority,
+and due date. Mention notifications include the work-item title and a comment
+excerpt. Both contain an **Open in Plane** button.
 
-Доступные подстановки:
+If your Plane installation uses a different URL format, change
+`WORK_ITEM_URL_TEMPLATE` in `.env`. Available placeholders are:
 
 - `{base}`;
 - `{workspace_slug}`;
@@ -197,7 +197,7 @@ Plane Webhooks v2 в документированном payload коммента
 - `{work_item_id}`;
 - `{sequence_id}`.
 
-## Локальная разработка
+## Local development
 
 ```bash
 python -m venv .venv
@@ -207,20 +207,21 @@ pytest
 ruff check .
 ```
 
-Для получения webhook Plane локально понадобится HTTPS-туннель. Не запускайте
-более одного процесса Uvicorn: приложение использует SQLite, а Telegram polling
-должен выполняться только в одном экземпляре.
+Receiving Plane webhooks locally requires an HTTPS tunnel. Do not run more than
+one Uvicorn process: the application uses SQLite, and Telegram polling must run
+in a single instance.
 
-## Безопасность
+## Security
 
-- запросы Plane проверяются по `X-Plane-Signature`;
-- в webhook-режиме запросы Telegram проверяются по
+- Plane requests are authenticated with `X-Plane-Signature`;
+- in webhook mode, Telegram requests are authenticated with
   `X-Telegram-Bot-Api-Secret-Token`;
-- коды связи одноразовые и хранятся только в виде SHA-256;
-- токены пользователей Plane сервису не нужны;
-- контейнер работает от непривилегированного пользователя;
-- секреты не включаются в Docker-образ.
+- one-time connection codes are stored only as SHA-256 hashes;
+- no Plane user tokens are required;
+- the container runs as an unprivileged user;
+- secrets are not included in the Docker image or application logs.
 
-## Лицензия
+## License
 
-MIT. Проект написан самостоятельно и не содержит кода community-мостов Plane.
+MIT. This project was written independently and does not include code from Plane
+community bridges.
