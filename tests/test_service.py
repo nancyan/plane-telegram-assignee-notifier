@@ -145,6 +145,62 @@ def test_comment_mention_by_structured_user_id(tmp_path):
     assert "упомянули" in telegram.messages[0][1]
 
 
+def test_comment_mention_by_plane_html_entity_identifier(tmp_path):
+    settings = Settings(
+        telegram_bot_token="token",
+        plane_webhook_secret="plane-secret-long-enough",
+        plane_app_url="https://plane.example.com",
+        plane_workspace_slug="acme",
+        database_path=str(tmp_path / "test.sqlite3"),
+    )
+    database = Database(settings.database_path)
+    database.initialize()
+    code = database.create_link_code("u1", 60, "Alice")
+    database.redeem_link_code(code, 123, 456, "alice")
+    telegram = FakeTelegram()
+    payload = make_payload("workitem.comment.created", [])
+    payload["data"]["comment"] = {
+        "actor_id": "u2",
+        "comment_stripped": "Проверьте, пожалуйста, Alice.",
+        "comment_html": (
+            '<p>Проверьте <mention-component id="transaction-1" '
+            'entity_identifier="u1" entity_name="Alice">'
+            "</mention-component></p>"
+        ),
+    }
+
+    assert mentioned_user_ids(payload) == {"u1"}
+    notifier = AssigneeNotifier(settings, database, telegram)
+    assert asyncio.run(notifier.process(payload)) == 1
+
+
+def test_comment_mention_by_plane_html_name_fallback(tmp_path):
+    settings = Settings(
+        telegram_bot_token="token",
+        plane_webhook_secret="plane-secret-long-enough",
+        plane_app_url="https://plane.example.com",
+        plane_workspace_slug="acme",
+        database_path=str(tmp_path / "test.sqlite3"),
+    )
+    database = Database(settings.database_path)
+    database.initialize()
+    code = database.create_link_code("u1", 60, "Alice Smith")
+    database.redeem_link_code(code, 123, 456, "alice")
+    telegram = FakeTelegram()
+    payload = make_payload("workitem.comment.created", [])
+    payload["data"]["comment"] = {
+        "actor_id": "u2",
+        "comment_stripped": "Проверьте, пожалуйста, Alice Smith.",
+        "comment_html": (
+            '<p><mention-component entity_name="Alice Smith">'
+            "</mention-component></p>"
+        ),
+    }
+
+    notifier = AssigneeNotifier(settings, database, telegram)
+    assert asyncio.run(notifier.process(payload)) == 1
+
+
 def test_comment_mention_by_configured_name_and_excludes_actor(tmp_path):
     settings = Settings(
         telegram_bot_token="token",
@@ -274,4 +330,42 @@ def test_legacy_comment_mention_is_supported(tmp_path):
     result = asyncio.run(notifier.process_detailed(payload, "issue_comment"))
 
     assert result.event == "workitem.comment.created"
+    assert result.sent == 1
+
+
+def test_legacy_comment_html_mention_is_supported(tmp_path):
+    settings = Settings(
+        telegram_bot_token="token",
+        plane_webhook_secret="plane-secret-long-enough",
+        plane_app_url="https://plane.example.com",
+        plane_workspace_slug="acme",
+        database_path=str(tmp_path / "test.sqlite3"),
+    )
+    database = Database(settings.database_path)
+    database.initialize()
+    code = database.create_link_code("u1", 60, "Alice")
+    database.redeem_link_code(code, 123, 456, "alice")
+    telegram = FakeTelegram()
+    payload = {
+        "event": "issue_comment",
+        "action": "created",
+        "data": {
+            "id": "comment-1",
+            "issue": "issue-1",
+            "project": "project-1",
+            "actor": "u2",
+            "comment_stripped": "Проверьте, пожалуйста, Alice.",
+            "comment_html": (
+                '<p><mention-component entity_identifier="u1" '
+                'entity_name="Alice"></mention-component></p>'
+            ),
+        },
+        "activity": {},
+    }
+
+    notifier = AssigneeNotifier(settings, database, telegram)
+    result = asyncio.run(notifier.process_detailed(payload, "issue_comment"))
+
+    assert result.event == "workitem.comment.created"
+    assert result.recipients == ["u1"]
     assert result.sent == 1

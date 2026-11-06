@@ -167,12 +167,11 @@ docker compose exec notifier python -m app.cli create-link PLANE_USER_UUID \
   --mention-name "Anna Smith"
 ```
 
-The documented Plane Webhooks v2 comment payload includes comment text but does
-not include the UUIDs of mentioned users. Therefore, the exact mention name
-must be provided when creating a link. If a Plane version supplies
-`mentioned_user_ids`, the service uses them automatically. To add a mention name
-for an already linked user, create a new link and connect the account again; the
-existing mapping is updated safely.
+The service reads mention UUIDs from structured webhook fields and from Plane's
+`mention-component` elements in `comment_html`. The configured mention name is
+used as a fallback for Plane versions that expose only stripped comment text.
+To add a mention name for an already linked user, create a new link and connect
+the account again; the existing mapping is updated safely.
 
 ### User commands
 

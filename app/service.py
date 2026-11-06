@@ -6,6 +6,7 @@ import logging
 import re
 from dataclasses import asdict, dataclass, field
 from html import escape
+from html.parser import HTMLParser
 
 from app.config import Settings
 from app.db import Database
@@ -49,6 +50,53 @@ def _ids(values) -> set[str]:
         if value:
             result.add(str(value))
     return result
+
+
+class _PlaneMentionParser(HTMLParser):
+    """Extract Plane mention metadata from TipTap's custom HTML element."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.user_ids: set[str] = set()
+        self.names: set[str] = set()
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        if tag.casefold() != "mention-component":
+            return
+        attributes = {
+            key.casefold().replace("-", "_"): value
+            for key, value in attrs
+            if value
+        }
+        for key in (
+            "entity_identifier",
+            "data_entity_identifier",
+            "user_id",
+            "data_user_id",
+            "member_id",
+            "data_member_id",
+        ):
+            if attributes.get(key):
+                self.user_ids.add(str(attributes[key]))
+        for key in ("entity_name", "data_entity_name", "name", "data_name"):
+            if attributes.get(key):
+                normalized = Database.normalize_mention_name(attributes[key])
+                if normalized:
+                    self.names.add(normalized)
+
+
+def _html_mentions(value: object) -> tuple[set[str], set[str]]:
+    if not isinstance(value, str) or not value:
+        return set(), set()
+    parser = _PlaneMentionParser()
+    try:
+        parser.feed(value)
+        parser.close()
+    except (TypeError, ValueError):
+        logger.warning("Could not parse Plane comment_html mention markup")
+    return parser.user_ids, parser.names
 
 
 def _legacy_event_id(payload: dict) -> str:
@@ -194,6 +242,8 @@ def mentioned_user_ids(payload: dict) -> set[str]:
                     value = value.get("user_id") or value.get("id")
                 if value:
                     result.add(str(value))
+        html_ids, _ = _html_mentions(container.get("comment_html"))
+        result.update(html_ids)
     return result
 
 
@@ -258,14 +308,27 @@ class AssigneeNotifier:
         data = payload.get("data") or {}
         comment = data.get("comment") or {}
         text = str(comment.get("comment_stripped") or "")
+        html_ids, html_names = _html_mentions(comment.get("comment_html"))
+        recipients.update(html_ids)
 
         # Documented Plane v2 comment webhooks contain only stripped text. Match
         # admin-configured Plane mention names, including display names with spaces.
-        for link in self.database.get_active_mention_links():
+        mention_links = self.database.get_active_mention_links()
+        for link in mention_links:
             alias = str(link["plane_mention_name"])
             pattern = rf"(?<![\w@])@{re.escape(alias)}(?![\w@])"
-            if re.search(pattern, text.casefold()):
+            if alias in html_names or re.search(pattern, text.casefold()):
                 recipients.add(str(link["plane_user_id"]))
+
+        logger.info(
+            "Comment mention diagnostics stripped_length=%d html_present=%s "
+            "html_mention_ids=%d html_mention_names=%d active_aliases=%d",
+            len(text),
+            bool(comment.get("comment_html")),
+            len(html_ids),
+            len(html_names),
+            len(mention_links),
+        )
 
         actor_id = comment.get("actor_id") or data.get("actor_id")
         if actor_id:
