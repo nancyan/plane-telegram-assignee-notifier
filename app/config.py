@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     plane_webhook_secret: str = Field(min_length=16)
     plane_app_url: str
     plane_workspace_slug: str
+    plane_api_key: str | None = None
     work_item_url_template: str = (
         "{base}/{workspace_slug}/projects/{project_id}/issues/{work_item_id}"
     )

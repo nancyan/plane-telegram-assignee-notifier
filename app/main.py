@@ -8,6 +8,7 @@ from fastapi import FastAPI, Header, HTTPException, Request, Response
 
 from app.config import get_settings
 from app.db import Database
+from app.plane import PlaneClient
 from app.security import constant_time_equal, verify_plane_signature
 from app.service import AssigneeNotifier, NotificationDeliveryError
 from app.telegram import TelegramClient, TelegramError
@@ -28,7 +29,16 @@ database = Database(settings.database_path)
 telegram = TelegramClient(
     settings.telegram_bot_token, proxy_url=settings.telegram_proxy_url
 )
-notifier = AssigneeNotifier(settings, database, telegram)
+plane = (
+    PlaneClient(
+        settings.plane_app_url,
+        settings.plane_workspace_slug,
+        settings.plane_api_key,
+    )
+    if settings.plane_api_key
+    else None
+)
+notifier = AssigneeNotifier(settings, database, telegram, plane_client=plane)
 
 
 async def _poll_telegram_updates() -> None:
@@ -61,10 +71,11 @@ async def lifespan(_: FastAPI):
     database.initialize()
     logger.info(
         "Notifier starting telegram_mode=%s proxy_configured=%s "
-        "plane_workspace=%s database=%s log_level=%s",
+        "plane_workspace=%s plane_api_configured=%s database=%s log_level=%s",
         settings.telegram_update_mode,
         bool(settings.telegram_proxy_url),
         settings.plane_workspace_slug,
+        bool(settings.plane_api_key),
         settings.database_path,
         settings.log_level.upper(),
     )
@@ -86,6 +97,8 @@ async def lifespan(_: FastAPI):
         with suppress(asyncio.CancelledError):
             await polling_task
     await telegram.close()
+    if plane:
+        await plane.close()
 
 
 app = FastAPI(

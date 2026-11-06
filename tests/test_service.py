@@ -18,6 +18,16 @@ class FakeTelegram:
         self.messages.append((chat_id, text, reply_markup))
 
 
+class FakePlaneClient:
+    def __init__(self, enrichment):
+        self.enrichment = enrichment
+        self.calls = []
+
+    async def enrich_work_item(self, data):
+        self.calls.append(data["id"])
+        return {**data, **self.enrichment}
+
+
 def make_payload(event, current, previous=None, event_id="event-1"):
     return {
         "version": "v2",
@@ -41,16 +51,12 @@ def test_created_notifies_all_assignees():
 
 
 def test_updated_notifies_only_new_assignee():
-    payload = make_payload(
-        "workitem.updated", ["u1", "u2"], {"assignee_ids": ["u1"]}
-    )
+    payload = make_payload("workitem.updated", ["u1", "u2"], {"assignee_ids": ["u1"]})
     assert new_assignee_ids(payload, "workitem.updated") == {"u2"}
 
 
 def test_unrelated_update_notifies_nobody():
-    payload = make_payload(
-        "workitem.updated", ["u1"], {"priority": "medium"}
-    )
+    payload = make_payload("workitem.updated", ["u1"], {"priority": "medium"})
     assert new_assignee_ids(payload, "workitem.updated") == set()
 
 
@@ -75,6 +81,40 @@ def test_delivery_is_deduplicated(tmp_path):
     assert asyncio.run(notifier.process(payload)) == 0
     assert len(telegram.messages) == 1
     assert telegram.messages[0][0] == 123
+
+
+def test_assignment_message_contains_project_labels_deadline_and_description(
+    tmp_path,
+):
+    settings = Settings(
+        telegram_bot_token="token",
+        plane_webhook_secret="plane-secret-long-enough",
+        plane_app_url="https://plane.example.com",
+        plane_workspace_slug="acme",
+        database_path=str(tmp_path / "test.sqlite3"),
+    )
+    database = Database(settings.database_path)
+    database.initialize()
+    code = database.create_link_code("u1", 60)
+    database.redeem_link_code(code, 123, 456, "alice")
+    telegram = FakeTelegram()
+    payload = make_payload("workitem.created", ["u1"])
+    payload["data"].update(
+        {
+            "project_name": "Website",
+            "labels": [{"id": "label-1", "name": "Urgent"}],
+            "target_date": "2026-12-01",
+            "description_html": "<p>Fix the <strong>login</strong> form.</p>",
+        }
+    )
+
+    notifier = AssigneeNotifier(settings, database, telegram)
+    assert asyncio.run(notifier.process(payload)) == 1
+    message = telegram.messages[0][1]
+    assert "Проект: Website" in message
+    assert "Теги: Urgent" in message
+    assert "Дедлайн: 2026-12-01" in message
+    assert "<b>Описание:</b>\nFix the login form." in message
 
 
 def test_detailed_result_explains_unlinked_recipient(tmp_path):
@@ -111,9 +151,7 @@ def test_detailed_result_explains_unsupported_event(tmp_path):
     database.initialize()
     notifier = AssigneeNotifier(settings, database, FakeTelegram())
 
-    result = asyncio.run(
-        notifier.process_detailed(make_payload("project.created", []))
-    )
+    result = asyncio.run(notifier.process_detailed(make_payload("project.created", [])))
 
     assert result.status == "ignored_unsupported_event"
     assert result.sent == 0
@@ -192,8 +230,7 @@ def test_comment_mention_by_plane_html_name_fallback(tmp_path):
         "actor_id": "u2",
         "comment_stripped": "Проверьте, пожалуйста, Alice Smith.",
         "comment_html": (
-            '<p><mention-component entity_name="Alice Smith">'
-            "</mention-component></p>"
+            '<p><mention-component entity_name="Alice Smith"></mention-component></p>'
         ),
     }
 
@@ -363,9 +400,26 @@ def test_legacy_comment_html_mention_is_supported(tmp_path):
         "activity": {},
     }
 
-    notifier = AssigneeNotifier(settings, database, telegram)
+    plane = FakePlaneClient(
+        {
+            "name": "Login bug",
+            "project_name": "Website",
+            "target_date": "2026-12-01",
+            "labels": [{"name": "Bug"}],
+            "description_stripped": "The login form does not submit.",
+        }
+    )
+    notifier = AssigneeNotifier(settings, database, telegram, plane_client=plane)
     result = asyncio.run(notifier.process_detailed(payload, "issue_comment"))
 
     assert result.event == "workitem.comment.created"
     assert result.recipients == ["u1"]
     assert result.sent == 1
+    assert plane.calls == ["issue-1"]
+    message = telegram.messages[0][1]
+    assert "<b>Login bug</b>" in message
+    assert "Проект: Website" in message
+    assert "Теги: Bug" in message
+    assert "Дедлайн: 2026-12-01" in message
+    assert "<b>Описание:</b>\nThe login form does not submit." in message
+    assert "<b>Комментарий:</b>\nПроверьте, пожалуйста, Alice." in message

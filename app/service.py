@@ -42,11 +42,7 @@ def _ids(values) -> set[str]:
     result: set[str] = set()
     for value in values:
         if isinstance(value, dict):
-            value = (
-                value.get("id")
-                or value.get("user_id")
-                or value.get("assignee_id")
-            )
+            value = value.get("id") or value.get("user_id") or value.get("assignee_id")
         if value:
             result.add(str(value))
     return result
@@ -60,15 +56,11 @@ class _PlaneMentionParser(HTMLParser):
         self.user_ids: set[str] = set()
         self.names: set[str] = set()
 
-    def handle_starttag(
-        self, tag: str, attrs: list[tuple[str, str | None]]
-    ) -> None:
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag.casefold() != "mention-component":
             return
         attributes = {
-            key.casefold().replace("-", "_"): value
-            for key, value in attrs
-            if value
+            key.casefold().replace("-", "_"): value for key, value in attrs if value
         }
         for key in (
             "entity_identifier",
@@ -87,6 +79,36 @@ class _PlaneMentionParser(HTMLParser):
                     self.names.add(normalized)
 
 
+class _PlainTextParser(HTMLParser):
+    """Convert the small HTML subset returned by Plane into readable text."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = {key.casefold(): value for key, value in attrs if value}
+        if tag.casefold() == "mention-component":
+            name = attributes.get("entity_name") or attributes.get("data-entity-name")
+            if name:
+                self.parts.append(f"@{name}")
+        elif tag.casefold() == "br":
+            self.parts.append(" ")
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.casefold() in {"p", "div", "li", "blockquote", "h1", "h2", "h3"}:
+            self.parts.append(" ")
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)
+
+    def text(self) -> str:
+        return " ".join("".join(self.parts).split())
+
+
 def _html_mentions(value: object) -> tuple[set[str], set[str]]:
     if not isinstance(value, str) or not value:
         return set(), set()
@@ -97,6 +119,18 @@ def _html_mentions(value: object) -> tuple[set[str], set[str]]:
     except (TypeError, ValueError):
         logger.warning("Could not parse Plane comment_html mention markup")
     return parser.user_ids, parser.names
+
+
+def _html_to_text(value: object) -> str:
+    if not isinstance(value, str) or not value:
+        return ""
+    parser = _PlainTextParser()
+    try:
+        parser.feed(value)
+        parser.close()
+    except (TypeError, ValueError):
+        logger.warning("Could not convert Plane HTML content to text")
+    return parser.text()
 
 
 def _legacy_event_id(payload: dict) -> str:
@@ -248,10 +282,86 @@ def mentioned_user_ids(payload: dict) -> set[str]:
 
 
 class AssigneeNotifier:
-    def __init__(self, settings: Settings, database: Database, telegram):
+    def __init__(
+        self,
+        settings: Settings,
+        database: Database,
+        telegram,
+        plane_client=None,
+    ):
         self.settings = settings
         self.database = database
         self.telegram = telegram
+        self.plane_client = plane_client
+
+    @staticmethod
+    def _project_name(data: dict) -> str | None:
+        for value in (
+            data.get("project_name"),
+            data.get("project_detail"),
+            data.get("project"),
+        ):
+            if isinstance(value, dict):
+                value = value.get("name")
+            if value and str(value) != str(data.get("project_id") or ""):
+                return str(value)
+        return None
+
+    @staticmethod
+    def _label_names(data: dict) -> list[str]:
+        names: list[str] = []
+        for key in ("labels", "label_details", "label_data"):
+            values = data.get(key) or []
+            if isinstance(values, dict | str):
+                values = [values]
+            for value in values:
+                if isinstance(value, dict):
+                    value = value.get("name") or value.get("label")
+                # UUID-only label lists do not contain a displayable name.
+                if value and not re.fullmatch(
+                    r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}",
+                    str(value),
+                ):
+                    name = str(value)
+                    if name not in names:
+                        names.append(name)
+        return names
+
+    def _metadata_lines(self, data: dict) -> list[str]:
+        lines: list[str] = []
+        project_name = self._project_name(data)
+        if project_name:
+            lines.append(f"Проект: {escape(project_name)}")
+        labels = self._label_names(data)
+        if labels:
+            lines.append(f"Теги: {escape(', '.join(labels))}")
+        target_date = data.get("target_date") or data.get("due_date")
+        if target_date not in (None, "None", ""):
+            lines.append(f"Дедлайн: {escape(str(target_date))}")
+        return lines
+
+    @staticmethod
+    def _excerpt(value: object, limit: int = 500) -> str:
+        text = " ".join(str(value or "").split())
+        if len(text) > limit:
+            return f"{text[: limit - 3]}..."
+        return text
+
+    def _description_excerpt(self, data: dict) -> str:
+        stripped = data.get("description_stripped")
+        if stripped:
+            return self._excerpt(stripped)
+        description = data.get("description")
+        if isinstance(description, str) and "<" not in description:
+            return self._excerpt(description)
+        html = data.get("description_html") or description
+        return self._excerpt(_html_to_text(html))
+
+    def _description_lines(self, data: dict) -> list[str]:
+        excerpt = self._description_excerpt(data)
+        if not excerpt:
+            return []
+        return ["", "<b>Описание:</b>", escape(excerpt)]
 
     def _work_item_url(self, data: dict) -> str:
         if not data.get("project_id") or not data.get("id"):
@@ -271,7 +381,6 @@ class AssigneeNotifier:
         title = escape(str(data.get("name") or "Без названия"))
         sequence = data.get("sequence_id")
         priority = escape(str(data.get("priority") or "none"))
-        target_date = data.get("target_date")
         reason = (
             "Вам назначена новая задача"
             if event_name == "workitem.created"
@@ -280,9 +389,9 @@ class AssigneeNotifier:
         lines = [f"<b>{escape(reason)}</b>", "", f"<b>{title}</b>"]
         if sequence not in (None, "None", ""):
             lines.append(f"Номер: #{escape(str(sequence))}")
+        lines.extend(self._metadata_lines(data))
         lines.append(f"Приоритет: {priority}")
-        if target_date not in (None, "None", ""):
-            lines.append(f"Срок: {escape(str(target_date))}")
+        lines.extend(self._description_lines(data))
         url = self._work_item_url(data)
         markup = {"inline_keyboard": [[{"text": "Открыть в Plane", "url": url}]]}
         return "\n".join(lines), markup
@@ -290,12 +399,15 @@ class AssigneeNotifier:
     def _comment_message(self, data: dict) -> tuple[str, dict]:
         title = escape(str(data.get("name") or "Без названия"))
         comment = data.get("comment") or {}
-        excerpt = " ".join(str(comment.get("comment_stripped") or "").split())
-        if len(excerpt) > 500:
-            excerpt = f"{excerpt[:497]}..."
+        comment_text = comment.get("comment_stripped") or _html_to_text(
+            comment.get("comment_html")
+        )
+        excerpt = self._excerpt(comment_text)
         lines = ["<b>Вас упомянули в комментарии</b>", "", f"<b>{title}</b>"]
+        lines.extend(self._metadata_lines(data))
+        lines.extend(self._description_lines(data))
         if excerpt:
-            lines.extend(["", escape(excerpt)])
+            lines.extend(["", "<b>Комментарий:</b>", escape(excerpt)])
         markup = {
             "inline_keyboard": [
                 [{"text": "Открыть в Plane", "url": self._work_item_url(data)}]
@@ -402,10 +514,8 @@ class AssigneeNotifier:
 
         if event_name == "workitem.comment.created":
             recipients = self._comment_recipients(payload)
-            message, markup = self._comment_message(data)
         else:
             recipients = new_assignee_ids(payload, event_name)
-            message, markup = self._message(data, event_name)
         result.recipients = sorted(recipients)
         logger.info(
             "Resolved Plane recipients event=%s event_id=%s count=%d ids=%s",
@@ -424,6 +534,20 @@ class AssigneeNotifier:
                 work_item_id or "<missing>",
             )
             return result
+
+        if self.plane_client:
+            try:
+                data = await self.plane_client.enrich_work_item(data)
+            except Exception:
+                logger.exception(
+                    "Unexpected Plane API enrichment failure work_item_id=%s",
+                    work_item_id or "<missing>",
+                )
+
+        if event_name == "workitem.comment.created":
+            message, markup = self._comment_message(data)
+        else:
+            message, markup = self._message(data, event_name)
 
         sent = 0
         failures: list[str] = []
