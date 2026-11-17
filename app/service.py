@@ -55,6 +55,7 @@ class _PlaneMentionParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.user_ids: set[str] = set()
         self.names: set[str] = set()
+        self.names_by_user_id: dict[str, str] = {}
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag.casefold() != "mention-component":
@@ -62,6 +63,7 @@ class _PlaneMentionParser(HTMLParser):
         attributes = {
             key.casefold().replace("-", "_"): value for key, value in attrs if value
         }
+        user_ids: list[str] = []
         for key in (
             "entity_identifier",
             "data_entity_identifier",
@@ -71,12 +73,19 @@ class _PlaneMentionParser(HTMLParser):
             "data_member_id",
         ):
             if attributes.get(key):
-                self.user_ids.add(str(attributes[key]))
+                user_id = str(attributes[key])
+                self.user_ids.add(user_id)
+                user_ids.append(user_id)
+        names: list[str] = []
         for key in ("entity_name", "data_entity_name", "name", "data_name"):
             if attributes.get(key):
                 normalized = Database.normalize_mention_name(attributes[key])
                 if normalized:
                     self.names.add(normalized)
+                    names.append(str(attributes[key]).strip())
+        if names:
+            for user_id in user_ids:
+                self.names_by_user_id[user_id] = names[0]
 
 
 class _PlainTextParser(HTMLParser):
@@ -91,7 +100,7 @@ class _PlainTextParser(HTMLParser):
         if tag.casefold() == "mention-component":
             name = attributes.get("entity_name") or attributes.get("data-entity-name")
             if name:
-                self.parts.append(f"@{name}")
+                self.parts.append(name)
         elif tag.casefold() == "br":
             self.parts.append(" ")
 
@@ -119,6 +128,31 @@ def _html_mentions(value: object) -> tuple[set[str], set[str]]:
     except (TypeError, ValueError):
         logger.warning("Could not parse Plane comment_html mention markup")
     return parser.user_ids, parser.names
+
+
+def _html_mention_names(value: object) -> dict[str, str]:
+    if not isinstance(value, str) or not value:
+        return {}
+    parser = _PlaneMentionParser()
+    try:
+        parser.feed(value)
+        parser.close()
+    except (TypeError, ValueError):
+        logger.warning("Could not parse Plane comment_html mention names")
+    return parser.names_by_user_id
+
+
+def _display_name(value: object) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    for key in ("display_name", "name", "full_name", "username", "email"):
+        candidate = value.get(key)
+        if candidate:
+            return str(candidate).strip()
+    full_name = " ".join(
+        str(value.get(key) or "").strip() for key in ("first_name", "last_name")
+    ).strip()
+    return full_name or None
 
 
 def _html_to_text(value: object) -> str:
@@ -212,7 +246,9 @@ def normalize_legacy_payload(payload: dict, header_event: str | None = None) -> 
         project = data.get("project")
         if isinstance(project, dict):
             project = project.get("id")
-        actor = data.get("actor") or data.get("created_by")
+        actor_value = data.get("actor") or data.get("created_by")
+        actor_name = _display_name(actor_value)
+        actor = actor_value
         if isinstance(actor, dict):
             actor = actor.get("id")
         comment = {
@@ -220,6 +256,8 @@ def normalize_legacy_payload(payload: dict, header_event: str | None = None) -> 
             "actor_id": actor,
             "comment_stripped": data.get("comment_stripped") or "",
         }
+        if actor_name:
+            comment["actor_name"] = actor_name
         return {
             "version": "v2",
             "event_id": event_id,
@@ -402,8 +440,22 @@ class AssigneeNotifier:
         comment_text = comment.get("comment_stripped") or _html_to_text(
             comment.get("comment_html")
         )
+        mention_names = _html_mention_names(comment.get("comment_html"))
+        for link in self.database.get_active_mention_links():
+            mention_names.setdefault(
+                str(link["plane_user_id"]), str(link["plane_mention_name"])
+            )
+        for user_id, name in mention_names.items():
+            comment_text = re.sub(
+                rf"(?<![\w-])@?{re.escape(user_id)}(?![\w-])",
+                name,
+                str(comment_text),
+            )
         excerpt = self._excerpt(comment_text)
         lines = ["<b>Вас упомянули в комментарии</b>", "", f"<b>{title}</b>"]
+        author = self._comment_author(comment)
+        if author:
+            lines.append(f"Автор: {escape(author)}")
         lines.extend(self._metadata_lines(data))
         lines.extend(self._description_lines(data))
         if excerpt:
@@ -414,6 +466,22 @@ class AssigneeNotifier:
             ]
         }
         return "\n".join(lines), markup
+
+    def _comment_author(self, comment: dict) -> str | None:
+        for key in ("actor_name", "author_name", "created_by_name"):
+            if comment.get(key):
+                return str(comment[key]).strip()
+        for key in ("actor", "author", "created_by"):
+            name = _display_name(comment.get(key))
+            if name:
+                return name
+        actor_id = comment.get("actor_id") or comment.get("created_by_id")
+        if not actor_id:
+            return None
+        link = self.database.get_active_link(str(actor_id))
+        if link and link["plane_mention_name"]:
+            return str(link["plane_mention_name"])
+        return str(actor_id)
 
     def _comment_recipients(self, payload: dict) -> set[str]:
         recipients = mentioned_user_ids(payload)

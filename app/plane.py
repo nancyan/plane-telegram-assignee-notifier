@@ -17,6 +17,7 @@ class PlaneClient:
             headers={"X-Api-Key": api_key},
         )
         self._project_cache: dict[str, dict] = {}
+        self._member_name_cache: dict[str, str | None] = {}
 
     async def close(self) -> None:
         await self.http.aclose()
@@ -80,6 +81,54 @@ class PlaneClient:
             self._project_cache[project_id] = result
         return result
 
+    async def get_member_display_name(self, user_id: str) -> str | None:
+        if user_id in self._member_name_cache:
+            return self._member_name_cache[user_id]
+
+        slug = quote(self.workspace_slug, safe="")
+        result = await self._get_first(
+            [f"/api/v2/workspaces/{slug}/members/"],
+            params={"member_id": user_id, "expand": "member", "per_page": 1},
+        )
+        rows = result.get("data") if result else None
+        if isinstance(rows, list):
+            for row in rows:
+                if not isinstance(row, dict) or str(row.get("member_id")) != user_id:
+                    continue
+                member = row.get("member") or {}
+                if isinstance(member, dict) and member.get("display_name"):
+                    name = str(member["display_name"]).strip()
+                    self._member_name_cache[user_id] = name
+                    return name
+
+        # Older self-hosted Plane releases expose flattened users through v1.
+        path = f"/api/v1/workspaces/{slug}/members/"
+        try:
+            response = await self.http.get(f"{self.base_url}{path}")
+        except httpx.HTTPError as exc:
+            logger.warning("Plane API network error path=%s error=%s", path, exc)
+        else:
+            if response.is_success:
+                try:
+                    rows = response.json()
+                except ValueError:
+                    rows = []
+                if isinstance(rows, list):
+                    for row in rows:
+                        if not isinstance(row, dict) or str(row.get("id")) != user_id:
+                            continue
+                        name = row.get("display_name") or " ".join(
+                            str(row.get(key) or "").strip()
+                            for key in ("first_name", "last_name")
+                        ).strip()
+                        if name:
+                            resolved = str(name).strip()
+                            self._member_name_cache[user_id] = resolved
+                            return resolved
+
+        self._member_name_cache[user_id] = None
+        return None
+
     async def enrich_work_item(self, data: dict) -> dict:
         result = dict(data)
         project_id = str(data.get("project_id") or "")
@@ -101,5 +150,19 @@ class PlaneClient:
             project = await self.get_project(project_id)
             if project and project.get("name"):
                 result["project_name"] = project["name"]
+
+        comment = result.get("comment")
+        if isinstance(comment, dict):
+            enriched_comment = dict(comment)
+            actor = enriched_comment.get("actor")
+            actor_name = None
+            if isinstance(actor, dict):
+                actor_name = actor.get("display_name") or actor.get("name")
+            actor_id = enriched_comment.get("actor_id")
+            if not actor_name and actor_id:
+                actor_name = await self.get_member_display_name(str(actor_id))
+            if actor_name:
+                enriched_comment["actor_name"] = str(actor_name)
+            result["comment"] = enriched_comment
 
         return result

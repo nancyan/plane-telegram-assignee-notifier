@@ -212,6 +212,41 @@ def test_comment_mention_by_plane_html_entity_identifier(tmp_path):
     assert asyncio.run(notifier.process(payload)) == 1
 
 
+def test_comment_message_shows_author_name_and_replaces_mention_id(tmp_path):
+    settings = Settings(
+        telegram_bot_token="token",
+        plane_webhook_secret="plane-secret-long-enough",
+        plane_app_url="https://plane.example.com",
+        plane_workspace_slug="acme",
+        database_path=str(tmp_path / "test.sqlite3"),
+    )
+    database = Database(settings.database_path)
+    database.initialize()
+    code = database.create_link_code("user-1", 60, "Alice Smith")
+    database.redeem_link_code(code, 123, 456, "alice")
+    telegram = FakeTelegram()
+    payload = make_payload("workitem.comment.created", [])
+    payload["data"]["comment"] = {
+        "actor_id": "user-2",
+        "actor_name": "Bob Jones",
+        "comment_stripped": "Проверьте, пожалуйста, @user-1.",
+        "comment_html": (
+            '<p>Проверьте, пожалуйста, <mention-component '
+            'entity_identifier="user-1" entity_name="Alice Smith">'
+            "</mention-component>.</p>"
+        ),
+        "mentioned_user_ids": ["user-1"],
+    }
+
+    notifier = AssigneeNotifier(settings, database, telegram)
+    assert asyncio.run(notifier.process(payload)) == 1
+
+    message = telegram.messages[0][1]
+    assert "Автор: Bob Jones" in message
+    assert "<b>Комментарий:</b>\nПроверьте, пожалуйста, Alice Smith." in message
+    assert "@user-1" not in message
+
+
 def test_comment_mention_by_plane_html_name_fallback(tmp_path):
     settings = Settings(
         telegram_bot_token="token",
