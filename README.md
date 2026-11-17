@@ -199,7 +199,7 @@ labels, priority, deadline, and a description preview. Mention notifications
 also include the comment author's display name, a short work-item description,
 and a detailed comment preview. Structured Plane mentions are rendered with the
 user's display name instead of their internal user ID or Plane's
-`@user_mention`/`@user_mentioned` placeholders.
+`user_mention`/`user_mentioned` placeholders, with or without a leading `@`.
 Both contain an **Open in Plane** button. Set `PLANE_API_KEY` to receive all
 fields with legacy Plane webhooks.
 

@@ -271,7 +271,7 @@ def test_comment_placeholder_uses_member_name_without_html(tmp_path):
     payload["data"]["comment"] = {
         "actor_id": "user-2",
         "actor_name": "Bob Jones",
-        "comment_stripped": "Проверьте, пожалуйста, @user_mentioned.",
+        "comment_stripped": "тест коммент user_mention",
         "mentioned_user_ids": ["user-1"],
     }
     plane = FakePlaneClient({}, {"user-1": "Alice Smith"})
@@ -281,8 +281,8 @@ def test_comment_placeholder_uses_member_name_without_html(tmp_path):
 
     message = telegram.messages[0][1]
     assert "Автор: Bob Jones" in message
-    assert "<b>Комментарий:</b>\nПроверьте, пожалуйста, Alice Smith." in message
-    assert "@user_mentioned" not in message
+    assert "<b>Комментарий:</b>\nтест коммент Alice Smith" in message
+    assert "user_mention" not in message
     assert f"<b>Описание:</b>\n{'A' * 157}..." in message
     assert "A" * 158 not in message
     assert plane.member_calls == ["user-1"]

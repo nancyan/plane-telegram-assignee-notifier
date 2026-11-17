@@ -12,7 +12,9 @@ from app.config import Settings
 from app.db import Database
 
 logger = logging.getLogger(__name__)
-_PLANE_MENTION_PLACEHOLDER = re.compile(r"@user_mention(?:ed)?\b", re.I)
+_PLANE_MENTION_PLACEHOLDER = re.compile(
+    r"(?<![\w@])@?user_mention(?:ed)?\b", re.I
+)
 
 
 class NotificationDeliveryError(RuntimeError):
