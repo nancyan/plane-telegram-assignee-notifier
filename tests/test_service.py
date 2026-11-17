@@ -235,7 +235,7 @@ def test_comment_message_shows_author_name_and_replaces_mention_id(tmp_path):
     payload["data"]["comment"] = {
         "actor_id": "user-2",
         "actor_name": "Bob Jones",
-        "comment_stripped": "Проверьте, пожалуйста, @user_mentioned.",
+        "comment_stripped": "Проверьте, пожалуйста, @user_mention.",
         "comment_html": (
             '<p>Проверьте, пожалуйста, <mention-component '
             'entity_identifier="user-1" entity_name="Alice Smith">'
@@ -250,7 +250,7 @@ def test_comment_message_shows_author_name_and_replaces_mention_id(tmp_path):
     message = telegram.messages[0][1]
     assert "Автор: Bob Jones" in message
     assert "<b>Комментарий:</b>\nПроверьте, пожалуйста, Alice Smith." in message
-    assert "@user_mentioned" not in message
+    assert "@user_mention" not in message
 
 
 def test_comment_placeholder_uses_member_name_without_html(tmp_path):

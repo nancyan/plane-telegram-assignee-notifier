@@ -12,6 +12,7 @@ from app.config import Settings
 from app.db import Database
 
 logger = logging.getLogger(__name__)
+_PLANE_MENTION_PLACEHOLDER = re.compile(r"@user_mention(?:ed)?\b", re.I)
 
 
 class NotificationDeliveryError(RuntimeError):
@@ -450,7 +451,7 @@ class AssigneeNotifier:
         html_text = _html_to_text(comment.get("comment_html"))
         stripped_text = str(comment.get("comment_stripped") or "")
         stripped_has_technical_mention = bool(
-            re.search(r"@user_mentioned\b", stripped_text, flags=re.I)
+            _PLANE_MENTION_PLACEHOLDER.search(stripped_text)
             or any(
                 re.search(
                     rf"(?<![\w-])@?{re.escape(user_id)}(?![\w-])",
@@ -476,8 +477,8 @@ class AssigneeNotifier:
             )
         unique_names = list(dict.fromkeys(mention_names.values()))
         if len(unique_names) == 1:
-            comment_text = re.sub(
-                r"@user_mentioned\b", unique_names[0], str(comment_text), flags=re.I
+            comment_text = _PLANE_MENTION_PLACEHOLDER.sub(
+                unique_names[0], str(comment_text)
             )
         excerpt = self._excerpt(comment_text)
         lines = ["<b>Вас упомянули в комментарии</b>", "", f"<b>{title}</b>"]
