@@ -196,9 +196,10 @@ the account again; the existing mapping is updated safely.
 
 Assignment notifications include the work-item title, project, sequence number,
 labels, priority, deadline, and a description preview. Mention notifications
-also include the comment author's display name and separate previews of the
-work-item description and the comment. Structured Plane mentions are rendered
-with the user's display name instead of their internal user ID.
+also include the comment author's display name, a short work-item description,
+and a detailed comment preview. Structured Plane mentions are rendered with the
+user's display name instead of their internal user ID or the `@user_mentioned`
+placeholder.
 Both contain an **Open in Plane** button. Set `PLANE_API_KEY` to receive all
 fields with legacy Plane webhooks.
 

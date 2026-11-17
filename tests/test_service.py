@@ -19,13 +19,19 @@ class FakeTelegram:
 
 
 class FakePlaneClient:
-    def __init__(self, enrichment):
+    def __init__(self, enrichment, member_names=None):
         self.enrichment = enrichment
+        self.member_names = member_names or {}
         self.calls = []
+        self.member_calls = []
 
     async def enrich_work_item(self, data):
         self.calls.append(data["id"])
         return {**data, **self.enrichment}
+
+    async def get_member_display_name(self, user_id):
+        self.member_calls.append(user_id)
+        return self.member_names.get(user_id)
 
 
 def make_payload(event, current, previous=None, event_id="event-1"):
@@ -229,7 +235,7 @@ def test_comment_message_shows_author_name_and_replaces_mention_id(tmp_path):
     payload["data"]["comment"] = {
         "actor_id": "user-2",
         "actor_name": "Bob Jones",
-        "comment_stripped": "Проверьте, пожалуйста, @user-1.",
+        "comment_stripped": "Проверьте, пожалуйста, @user_mentioned.",
         "comment_html": (
             '<p>Проверьте, пожалуйста, <mention-component '
             'entity_identifier="user-1" entity_name="Alice Smith">'
@@ -244,7 +250,42 @@ def test_comment_message_shows_author_name_and_replaces_mention_id(tmp_path):
     message = telegram.messages[0][1]
     assert "Автор: Bob Jones" in message
     assert "<b>Комментарий:</b>\nПроверьте, пожалуйста, Alice Smith." in message
-    assert "@user-1" not in message
+    assert "@user_mentioned" not in message
+
+
+def test_comment_placeholder_uses_member_name_without_html(tmp_path):
+    settings = Settings(
+        telegram_bot_token="token",
+        plane_webhook_secret="plane-secret-long-enough",
+        plane_app_url="https://plane.example.com",
+        plane_workspace_slug="acme",
+        database_path=str(tmp_path / "test.sqlite3"),
+    )
+    database = Database(settings.database_path)
+    database.initialize()
+    code = database.create_link_code("user-1", 60)
+    database.redeem_link_code(code, 123, 456, "alice")
+    telegram = FakeTelegram()
+    payload = make_payload("workitem.comment.created", [])
+    payload["data"]["description_stripped"] = "A" * 220
+    payload["data"]["comment"] = {
+        "actor_id": "user-2",
+        "actor_name": "Bob Jones",
+        "comment_stripped": "Проверьте, пожалуйста, @user_mentioned.",
+        "mentioned_user_ids": ["user-1"],
+    }
+    plane = FakePlaneClient({}, {"user-1": "Alice Smith"})
+
+    notifier = AssigneeNotifier(settings, database, telegram, plane_client=plane)
+    assert asyncio.run(notifier.process(payload)) == 1
+
+    message = telegram.messages[0][1]
+    assert "Автор: Bob Jones" in message
+    assert "<b>Комментарий:</b>\nПроверьте, пожалуйста, Alice Smith." in message
+    assert "@user_mentioned" not in message
+    assert f"<b>Описание:</b>\n{'A' * 157}..." in message
+    assert "A" * 158 not in message
+    assert plane.member_calls == ["user-1"]
 
 
 def test_comment_mention_by_plane_html_name_fallback(tmp_path):

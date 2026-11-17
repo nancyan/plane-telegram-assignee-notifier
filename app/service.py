@@ -385,18 +385,18 @@ class AssigneeNotifier:
             return f"{text[: limit - 3]}..."
         return text
 
-    def _description_excerpt(self, data: dict) -> str:
+    def _description_excerpt(self, data: dict, limit: int = 500) -> str:
         stripped = data.get("description_stripped")
         if stripped:
-            return self._excerpt(stripped)
+            return self._excerpt(stripped, limit)
         description = data.get("description")
         if isinstance(description, str) and "<" not in description:
-            return self._excerpt(description)
+            return self._excerpt(description, limit)
         html = data.get("description_html") or description
-        return self._excerpt(_html_to_text(html))
+        return self._excerpt(_html_to_text(html), limit)
 
-    def _description_lines(self, data: dict) -> list[str]:
-        excerpt = self._description_excerpt(data)
+    def _description_lines(self, data: dict, limit: int = 500) -> list[str]:
+        excerpt = self._description_excerpt(data, limit)
         if not excerpt:
             return []
         return ["", "<b>Описание:</b>", escape(excerpt)]
@@ -437,19 +437,47 @@ class AssigneeNotifier:
     def _comment_message(self, data: dict) -> tuple[str, dict]:
         title = escape(str(data.get("name") or "Без названия"))
         comment = data.get("comment") or {}
-        comment_text = comment.get("comment_stripped") or _html_to_text(
-            comment.get("comment_html")
-        )
         mention_names = _html_mention_names(comment.get("comment_html"))
-        for link in self.database.get_active_mention_links():
-            mention_names.setdefault(
-                str(link["plane_user_id"]), str(link["plane_mention_name"])
+        mention_names.update(comment.get("mention_names") or {})
+        mentioned_ids = set(mention_names)
+        for key in (
+            "mentioned_user_ids",
+            "mention_ids",
+            "mentions",
+            "mentioned_users",
+        ):
+            mentioned_ids.update(_ids(comment.get(key)))
+        html_text = _html_to_text(comment.get("comment_html"))
+        stripped_text = str(comment.get("comment_stripped") or "")
+        stripped_has_technical_mention = bool(
+            re.search(r"@user_mentioned\b", stripped_text, flags=re.I)
+            or any(
+                re.search(
+                    rf"(?<![\w-])@?{re.escape(user_id)}(?![\w-])",
+                    stripped_text,
+                )
+                for user_id in mention_names
             )
+        )
+        comment_text = (
+            html_text
+            if mention_names and html_text and stripped_has_technical_mention
+            else stripped_text or html_text
+        )
+        for link in self.database.get_active_mention_links():
+            user_id = str(link["plane_user_id"])
+            if user_id in mentioned_ids:
+                mention_names.setdefault(user_id, str(link["plane_mention_name"]))
         for user_id, name in mention_names.items():
             comment_text = re.sub(
                 rf"(?<![\w-])@?{re.escape(user_id)}(?![\w-])",
                 name,
                 str(comment_text),
+            )
+        unique_names = list(dict.fromkeys(mention_names.values()))
+        if len(unique_names) == 1:
+            comment_text = re.sub(
+                r"@user_mentioned\b", unique_names[0], str(comment_text), flags=re.I
             )
         excerpt = self._excerpt(comment_text)
         lines = ["<b>Вас упомянули в комментарии</b>", "", f"<b>{title}</b>"]
@@ -457,7 +485,7 @@ class AssigneeNotifier:
         if author:
             lines.append(f"Автор: {escape(author)}")
         lines.extend(self._metadata_lines(data))
-        lines.extend(self._description_lines(data))
+        lines.extend(self._description_lines(data, limit=160))
         if excerpt:
             lines.extend(["", "<b>Комментарий:</b>", escape(excerpt)])
         markup = {
@@ -611,6 +639,26 @@ class AssigneeNotifier:
                     "Unexpected Plane API enrichment failure work_item_id=%s",
                     work_item_id or "<missing>",
                 )
+
+        if event_name == "workitem.comment.created" and self.plane_client:
+            resolver = getattr(self.plane_client, "get_member_display_name", None)
+            if resolver:
+                comment = dict(data.get("comment") or {})
+                mention_names = dict(comment.get("mention_names") or {})
+                for user_id in recipients:
+                    try:
+                        name = await resolver(user_id)
+                    except Exception:
+                        logger.exception(
+                            "Could not resolve Plane mention display name user_id=%s",
+                            user_id,
+                        )
+                        continue
+                    if name:
+                        mention_names[user_id] = str(name)
+                if mention_names:
+                    comment["mention_names"] = mention_names
+                    data = {**data, "comment": comment}
 
         if event_name == "workitem.comment.created":
             message, markup = self._comment_message(data)
